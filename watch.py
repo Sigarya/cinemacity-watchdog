@@ -1,325 +1,175 @@
 #!/usr/bin/env python3
-"""Hlídá rozpis Cinema City a hlásí nově vypsaná představení.
+"""Cinema City Flora: notify about *analogue* IMAX 70mm showtimes on Jan 6–13, 2027.
 
-Ve výchozím nastavení: film "Duna" v sále, jehož název obsahuje "IMAX".
-Data bere z veřejného JSON API cinemacity.cz (bez klíče, bez přihlášení).
-
-Stav (už viděná představení) drží v JSON souboru, takže při každém běhu
-hlásí jen to, co přibylo od minule.
+Uses Cinema City's public Quickbook schedule endpoint. No login or API key needed.
 """
-
 import argparse
 import json
 import os
 import sys
 import time
-import urllib.error
-import urllib.request
-from datetime import date, datetime, timedelta
+from datetime import datetime, date, timedelta
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
-SITE_ID = "10101"  # cinemacity.cz
-BASE = f"https://www.cinemacity.cz/cz/data-api-service/v1/quickbook/{SITE_ID}"
-LANG = "cs_CZ"
-UA = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-)
-
-FILM_PATTERN = os.environ.get("FILM_PATTERN", "duna").lower()
-AUDITORIUM_PATTERN = os.environ.get("AUDITORIUM_PATTERN", "imax").lower()
-HORIZON_DAYS = int(os.environ.get("HORIZON_DAYS", "180"))
-# Atribut, podle kterého API umí filtrovat kina — levná nápověda, kde hledat
-# IMAX sály. Doplňuje (nenahrazuje) sondu podle názvu sálu.
-HINT_ATTR = os.environ.get("HINT_ATTR", "70-mm")
-DELAY = float(os.environ.get("REQUEST_DELAY", "0.25"))
-
-CZ_DAYS = ["po", "út", "st", "čt", "pá", "so", "ne"]
-
-# API vrací eventDateTime bez zóny, v místním čase kina. Runner v GitHub
-# Actions jede v UTC, takže by se čas představení porovnával s časem o dvě
-# hodiny pozadu — projekce, která právě doběhla, by vypadala jako budoucí
-# a při zmizení z rozpisu by se falešně nahlásila jako zrušená.
-CINEMA_TZ = ZoneInfo("Europe/Prague")
+BASE = "https://www.cinemacity.cz/cz/data-api-service/v1/quickbook/10101"
+CINEMA_ID = "1052"  # Praha Flora
+CINEMA_NAME = "Cinema City Flora (Prague)"
+START_DAY = date(2027, 1, 6)
+END_DAY = date(2027, 1, 13)
+PRAGUE = ZoneInfo("Europe/Prague")
+USER_AGENT = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
 
-def now():
-    """Aktuální čas v zóně kina, bez tzinfo — porovnatelný s daty z API."""
-    return datetime.now(CINEMA_TZ).replace(tzinfo=None)
+def days_in_trip():
+    current = START_DAY
+    while current <= END_DAY:
+        yield current
+        current += timedelta(days=1)
 
 
-def api(path):
-    """GET na data-api-service; vrací obsah klíče "body"."""
-    url = f"{BASE}{path}"
-    last = None
-    for attempt in range(4):
+def fetch_api(path):
+    url = BASE + path
+    last_error = None
+    for attempt in range(3):
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": UA})
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read().decode("utf-8"))["body"]
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-            last = exc
-            time.sleep(2 ** attempt)
-    raise SystemExit(f"API selhalo po 4 pokusech: {url}\n{last}")
+            req = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
+            with urlopen(req, timeout=20) as response:
+                obj = json.load(response)
+            if not isinstance(obj, dict) or not isinstance(obj.get("body"), dict):
+                raise ValueError("Unexpected API response")
+            return obj["body"]
+        except (HTTPError, URLError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
+            last_error = exc
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+    raise RuntimeError(f"Cinema City request failed for {url}: {last_error}")
 
 
-def horizon():
-    return (date.today() + timedelta(days=HORIZON_DAYS)).isoformat()
+def fetch_day(day):
+    return fetch_api(f"/film-events/in-cinema/{CINEMA_ID}/at-date/{day.isoformat()}?attr=&lang=cs_CZ")
 
 
-def fetch_cinemas():
-    body = api(f"/cinemas/with-event/until/{horizon()}?attr=&lang={LANG}")
-    return {c["id"]: c for c in body["cinemas"]}
+def available_trip_days():
+    # Only query dates the cinema has published. Unscheduled dates may 404.
+    body = fetch_api(f"/dates/in-cinema/{CINEMA_ID}/until/{END_DAY.isoformat()}?attr=&lang=cs_CZ")
+    dates = set(str(d)[:10] for d in (body.get("dates") or []))
+    return [day for day in days_in_trip() if day.isoformat() in dates]
 
 
-def fetch_dates(cinema_id):
-    time.sleep(DELAY)
-    return api(f"/dates/in-cinema/{cinema_id}/until/{horizon()}?attr=&lang={LANG}")["dates"]
+def is_analogue_imax70mm(event):
+    auditorium = (event.get("auditorium") or "").lower()
+    attrs = {str(a).lower() for a in (event.get("attributeIds") or [])}
+    return "imax" in auditorium and "70-mm" in attrs
 
 
-def fetch_day(cinema_id, day):
-    time.sleep(DELAY)
-    body = api(f"/film-events/in-cinema/{cinema_id}/at-date/{day}?attr=&lang={LANG}")
-    films = {f["id"]: f for f in body.get("films", [])}
-    return films, body.get("events", [])
-
-
-def hint_cinema_ids():
-    """Kina, která podle API mají představení s atributem HINT_ATTR."""
-    if not HINT_ATTR:
-        return set()
-    body = api(f"/cinemas/with-event/until/{horizon()}?attr={HINT_ATTR}&lang={LANG}")
-    return {c["id"] for c in body["cinemas"]}
-
-
-def is_target_hall(event):
-    return AUDITORIUM_PATTERN in (event.get("auditorium") or "").lower()
-
-
-def collect():
-    """Projde relevantní kina a vrátí {event_id: záznam} pro hlídaná představení.
-
-    Aby se netahal celý rozpis všech kin, běží to dvoufázově: nejdřív se
-    zjistí, která kina vůbec mají hlídaný sál (jedna sonda na kino + nápověda
-    z API), a teprve ta se projdou do hloubky.
-    """
-    cinemas = fetch_cinemas()
-    dates_by_cinema = {cid: fetch_dates(cid) for cid in cinemas}
-
-    candidates = hint_cinema_ids() & set(cinemas)
-    day_cache = {}
-    for cid, days in dates_by_cinema.items():
-        if not days:
-            continue
-        probe = days[0]
-        day_cache[(cid, probe)] = fetch_day(cid, probe)
-        if any(is_target_hall(e) for e in day_cache[(cid, probe)][1]):
-            candidates.add(cid)
-
+def parse_events(day, body):
+    films = {str(f["id"]): f for f in body.get("films", []) if "id" in f}
     found = {}
-    for cid in sorted(candidates):
-        for day in dates_by_cinema.get(cid, []):
-            films, events = day_cache.get((cid, day)) or fetch_day(cid, day)
-            for e in events:
-                film = films.get(e["filmId"], {})
-                if FILM_PATTERN not in film.get("name", "").lower():
-                    continue
-                if not is_target_hall(e):
-                    continue
-                found[e["id"]] = {
-                    "id": e["id"],
-                    "film": film.get("name", e["filmId"]),
-                    "filmLink": film.get("link"),
-                    "cinema": cinemas[cid]["displayName"],
-                    "cinemaId": cid,
-                    "datetime": e["eventDateTime"],
-                    "auditorium": e.get("auditorium"),
-                    "attrs": e.get("attributeIds", []),
-                    # Žádné z polí, která API nabízí, není použitelné jako
-                    # odkaz: bookingLink vrací na GET 404, obsoleteBookingUrl
-                    # je i podle názvu mrtvý a bookingRouterLaunchLink vede na
-                    # stránku se samoodesílacím POST formulářem, jehož cíl
-                    # (tickets.rel.…) na přímý GET odpoví 403. Ten POST ale
-                    # skončí na prosté adrese /order/{id}, která funguje i na
-                    # GET a otevře rovnou výběr sedadel. Pozor, parametr lang
-                    # tady dělá 404 — musí se vynechat.
-                    "booking": f"https://tickets.cinemacity.cz/order/{e.get('presentationCode') or e['id']}",
-                    "soldOut": bool(e.get("soldOut")),
-                }
+    for event in body.get("events", []):
+        if not is_analogue_imax70mm(event):
+            continue
+        iso = str(event.get("eventDateTime", ""))
+        # Validate local calendar date; API endpoint is date-scoped but check anyway.
+        if iso[:10] != day.isoformat():
+            continue
+        eid = str(event.get("id", ""))
+        if not eid:
+            continue
+        film = films.get(str(event.get("filmId", "")), {})
+        code = event.get("presentationCode") or eid
+        found[eid] = {
+            "id": eid,
+            "film": film.get("name") or "Film (title unavailable)",
+            "datetime": iso,
+            "auditorium": event.get("auditorium") or "IMAX",
+            "cinema": CINEMA_NAME,
+            "soldOut": bool(event.get("soldOut")),
+            "booking": f"https://tickets.cinemacity.cz/order/{code}",
+        }
     return found
 
 
-def load_state(path):
+def collect():
+    all_events = {}
+    for day in available_trip_days():
+        all_events.update(parse_events(day, fetch_day(day)))
+        time.sleep(0.12)  # keep requests gentle
+    return all_events
+
+
+def read_state(path):
     try:
-        with open(path, encoding="utf-8") as fh:
-            return json.load(fh)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data.get("events"), dict):
+            raise ValueError("Invalid state format")
+        return data
     except FileNotFoundError:
-        return {"updated": None, "events": {}}
+        return {"events": {}}
 
 
-def save_state(path, events):
-    """Zapíše stav, ale jen když se změnila množina představení.
-
-    Kdyby se soubor přepisoval při každém běhu, měnilo by se v něm razítko
-    "updated" a workflow by si po sobě commitoval prázdnou změnu 48× denně.
-    Rozhoduje proto seznam ID — to je přesně to, na čem stojí hlášení.
-    Volatilní pole (soldOut) se tím pádem neaktualizují; drží se hodnota
-    z chvíle, kdy se představení objevilo poprvé, což je i to, co se hlásí.
-    """
-    if set(events) == set(load_state(path).get("events", {})):
-        return False
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    payload = {
-        "updated": now().replace(microsecond=0).isoformat(),
-        "events": dict(sorted(events.items(), key=lambda kv: kv[1]["datetime"])),
-    }
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(payload, fh, ensure_ascii=False, indent=1, sort_keys=False)
-        fh.write("\n")
-    return True
+def write_state(path, state):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rendered = json.dumps(state, indent=2, ensure_ascii=False, sort_keys=True) + "\n"
+    if not path.exists() or path.read_text(encoding="utf-8") != rendered:
+        path.write_text(rendered, encoding="utf-8")
 
 
-def prune_past(events):
-    """Zahodí ze stavu představení, která už proběhla — ať soubor neroste."""
-    cutoff = (now() - timedelta(days=1)).isoformat()
-    return {k: v for k, v in events.items() if v["datetime"] >= cutoff}
-
-
-def fmt_dt(iso):
-    dt = datetime.fromisoformat(iso)
-    return f"{CZ_DAYS[dt.weekday()]} {dt.day}. {dt.month}. {dt.year} v {dt:%H:%M}"
-
-
-def fmt_short(iso):
-    dt = datetime.fromisoformat(iso)
-    return f"{dt.day}. {dt.month}."
-
-
-def render(new_events, gone_events):
-    """Markdown tělo hlášení."""
-    lines = []
-    if new_events:
-        lines.append(f"### Nově vypsáno ({len(new_events)})\n")
-        for cinema, group in group_by_cinema(new_events):
-            lines.append(f"**{cinema}**\n")
-            for e in group:
-                flags = []
-                if "70-mm" in e["attrs"]:
-                    flags.append("70mm")
-                if "subbed" in e["attrs"]:
-                    flags.append("titulky")
-                if "dubbed" in e["attrs"]:
-                    flags.append("dabing")
-                if e["soldOut"]:
-                    flags.append("**vyprodáno**")
-                suffix = f" — {', '.join(flags)}" if flags else ""
-                link = f" — [koupit]({e['booking']})" if e["booking"] else ""
-                lines.append(f"- {fmt_dt(e['datetime'])} · {e['auditorium']}{suffix}{link}")
-            lines.append("")
-    if gone_events:
-        lines.append(f"### Zmizelo z rozpisu ({len(gone_events)})\n")
-        for cinema, group in group_by_cinema(gone_events):
-            lines.append(f"**{cinema}**\n")
-            for e in group:
-                lines.append(f"- {fmt_dt(e['datetime'])} · {e['auditorium']}")
-            lines.append("")
-    film_link = next(
-        (e["filmLink"] for e in list(new_events) + list(gone_events) if e.get("filmLink")),
-        None,
-    )
-    if film_link:
-        lines.append(f"[Stránka filmu na Cinema City]({film_link})")
-    lines.append("")
-    lines.append(
-        f"<sub>Zkontrolováno {now():%d. %m. %Y %H:%M} · "
-        f"film ~ `{FILM_PATTERN}` · sál ~ `{AUDITORIUM_PATTERN}`</sub>"
-    )
-    return "\n".join(lines)
-
-
-def group_by_cinema(events):
-    order = {}
-    for e in sorted(events, key=lambda x: (x["cinema"], x["datetime"])):
-        order.setdefault(e["cinema"], []).append(e)
-    return order.items()
-
-
-def title_for(new_events):
-    film = new_events[0]["film"]
-    days = sorted({e["datetime"][:10] for e in new_events})
-    span = fmt_short(days[0])
-    if len(days) > 1:
-        span += f"–{fmt_short(days[-1])}"
-    n = len(new_events)
-    word = "nový termín" if n == 1 else ("nové termíny" if n < 5 else "nových termínů")
-    return f"🎬 {film} v IMAXu: {n} {word} ({span})"
-
-
-def gh_output(**kwargs):
-    path = os.environ.get("GITHUB_OUTPUT")
-    if not path:
-        return
-    with open(path, "a", encoding="utf-8") as fh:
-        for key, value in kwargs.items():
-            fh.write(f"{key}={value}\n")
+def notify_output(value):
+    if path := os.environ.get("GITHUB_OUTPUT"):
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"has_news={'true' if value else 'false'}\n")
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--state", default="state/seen.json", help="soubor se stavem")
-    ap.add_argument("--seed", action="store_true", help="jen ulož stav, nic nehlas")
-    ap.add_argument("--force-report", action="store_true", help="nahlas vše, i známé")
-    ap.add_argument("--report", default="report.md", help="kam zapsat markdown hlášení")
-    ap.add_argument("--title", default="title.txt", help="kam zapsat titulek issue")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--state", default="state/seen.json")
+    parser.add_argument("--report", default="report.md")
+    parser.add_argument("--title", default="title.txt")
+    parser.add_argument("--force-report", action="store_true")
+    args = parser.parse_args()
+
+    # Keep the GitHub workflow harmless after the user's trip ends.
+    if datetime.now(PRAGUE).date() > END_DAY:
+        print("Trip ended. Stop/disable this workflow in GitHub Actions.")
+        notify_output(False)
+        return 0
 
     current = collect()
-    state = load_state(args.state)
-    known = state.get("events", {})
+    state_path = Path(args.state)
+    state = read_state(state_path)
+    old = state["events"]
+    new = [v for k, v in current.items() if args.force_report or k not in old]
+    new.sort(key=lambda v: (v["datetime"], v["film"]))
 
-    print(f"Nalezeno {len(current)} hlídaných představení, ve stavu {len(known)}.")
+    # Keep all previously observed IDs so a briefly withdrawn event doesn't
+    # cause duplicate new-event alerts after being relisted.
+    merged = dict(old)
+    merged.update(current)
+    write_state(state_path, {"events": merged})
 
-    if args.seed:
-        save_state(args.state, prune_past(current))
-        print(f"Stav zapsán do {args.state} (seed, nic se nehlásí).")
-        gh_output(has_news="false")
-        return
+    if not new:
+        print(f"Checked {len(current)} IMAX 70mm showtimes for Jan 6–13. No new screenings.")
+        notify_output(False)
+        return 0
 
-    if args.force_report:
-        new_events = sorted(current.values(), key=lambda e: e["datetime"])
-        gone = []
-    else:
-        new_events = sorted(
-            (v for k, v in current.items() if k not in known),
-            key=lambda e: e["datetime"],
-        )
-        future = now().isoformat()
-        gone = sorted(
-            (v for k, v in known.items() if k not in current and v["datetime"] > future),
-            key=lambda e: e["datetime"],
-        )
-
-    save_state(args.state, prune_past(current))
-
-    if not new_events and not gone:
-        print("Nic nového.")
-        gh_output(has_news="false")
-        return
-
-    body = render(new_events, gone)
-    if new_events:
-        title = title_for(new_events)
-    else:
-        film = gone[0]["film"]
-        title = f"🎬 {film} v IMAXu: zrušené termíny"
-    with open(args.report, "w", encoding="utf-8") as fh:
-        fh.write(body + "\n")
-    with open(args.title, "w", encoding="utf-8") as fh:
-        fh.write(title + "\n")
-
-    print(f"\n{title}\n")
-    print(body)
-    gh_output(has_news="true")
+    lines = ["### New genuine IMAX 70mm showtimes — Cinema City Flora", "",
+             "**Dates watched:** January 6–13, 2027 · **Format:** analogue IMAX 70mm film", ""]
+    for e in new:
+        d = datetime.fromisoformat(e["datetime"])
+        availability = " (currently marked sold out)" if e["soldOut"] else ""
+        lines.append(f"- **{d:%a %d %b %Y, %H:%M}** — {e['film']}{availability} — "
+                     f"[**Choose seats / buy tickets**]({e['booking']})")
+    lines.extend(["", "The format is matched using both the IMAX auditorium and the `70-mm` screening attribute.",
+                  "Verify the film format again on the ticket page before paying."])
+    Path(args.report).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    Path(args.title).write_text(f"🎞️ Prague IMAX 70mm: {len(new)} new January screening(s) — tickets", encoding="utf-8")
+    print(f"Found {len(new)} new screenings. Ticket links written to {args.report}.")
+    notify_output(True)
+    return 0
 
 
 if __name__ == "__main__":
