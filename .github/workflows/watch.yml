@@ -1,6 +1,10 @@
 name: Prague IMAX 70mm ticket watch
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/watch.yml'
   schedule:
     # Every five minutes. GitHub may delay or skip scheduled executions.
     - cron: '3/5 * * * *'
