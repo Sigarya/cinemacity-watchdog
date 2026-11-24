@@ -1,10 +1,9 @@
-name: Prague IMAX 70mm ticket watch (4 per hour)
+name: Prague IMAX 70mm - five minute ticket watch
 
-# Use the original watchdog's four times/hour schedule, deliberately away from busy :00/:30.
+# Check every five minutes (GitHub may delay or omit scheduled runs).
 on:
   schedule:
-    - cron: '8,38 * * * *'
-    - cron: '21,51 * * * *'
+    - cron: '2/5 * * * *'
   workflow_dispatch:
     inputs:
       force_report:
