@@ -1,0 +1,68 @@
+name: Prague IMAX 70mm - five minute ticket watch
+
+# A NEW workflow (not the schedule-disabled workflow inherited from the fork).
+on:
+  schedule:
+    # Once every five minutes, away from the busy top of the hour (UTC).
+    - cron: '4-59/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      force_report:
+        description: 'Re-report all published Jan 6–13 IMAX 70mm showtimes'
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/imax70mm-five-minute.yml'
+
+concurrency:
+  group: prague-imax70mm-ticket-watch
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check new analogue IMAX 70mm showtimes
+        id: watch
+        run: |
+          python3 watch.py --state state/seen.json --report report.md --title title.txt \
+            ${{ inputs.force_report && '--force-report' || '' }}
+      - name: Alert on newly listed ticket sessions
+        if: steps.watch.outputs.has_news == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Keep issues OPEN so that GitHub mobile has time to deliver push alerts.
+          gh issue create \
+            --title "$(cat title.txt)" \
+            --body-file report.md \
+            --assignee "${{ github.repository_owner }}"
+      - name: Save observed sessions to prevent repeat alerts
+        run: |
+          rm -f report.md title.txt
+          if git diff --quiet -- state/seen.json; then
+            echo 'Nothing changed.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add state/seen.json
+          git commit -m 'Update IMAX 70mm watch state'
+          for i in 1 2 3; do
+            git pull --rebase --quiet origin "${GITHUB_REF_NAME}" && git push && exit 0
+            sleep 5
+          done
+          exit 1
